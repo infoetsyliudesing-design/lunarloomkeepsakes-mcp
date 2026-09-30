@@ -1,43 +1,199 @@
 import os
-from typing import Any
+import base64
+import hashlib
+import secrets
+from urllib.parse import urlencode
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 ETSY_API_BASE = "https://api.etsy.com/v3/application"
 ETSY_TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
+ETSY_AUTH_URL = "https://www.etsy.com/oauth/connect"
+
+ETSY_API_KEY = os.environ["ETSY_API_KEY"]
+ETSY_SHARED_SECRET = os.environ["ETSY_SHARED_SECRET"]
+
+# This must match the URL registered in Etsy exactly.
+REDIRECT_URI = os.environ["ETSY_REDIRECT_URI"]
 
 mcp = FastMCP(
     "Lunar Loom Keepsakes Etsy MCP",
     stateless_http=True,
 )
 
+# Temporary OAuth data.
+# This is sufficient for the one-time authorization flow.
+oauth_sessions = {}
 
-async def get_access_token() -> str:
-    refresh_token = os.environ["ETSY_REFRESH_TOKEN"]
-    api_key = os.environ["ETSY_API_KEY"]
 
-    async with httpx.AsyncClient() as client:
+def create_pkce_pair():
+    verifier = (
+        base64.urlsafe_b64encode(secrets.token_bytes(32))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+    challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode("ascii")).digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+    return verifier, challenge
+
+
+@mcp.custom_route("/oauth/start", methods=["GET"])
+async def oauth_start(request: Request):
+    state = secrets.token_urlsafe(32)
+    verifier, challenge = create_pkce_pair()
+
+    oauth_sessions[state] = verifier
+
+    params = {
+        "response_type": "code",
+        "client_id": ETSY_API_KEY,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "listings_r shops_r",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+
+    url = f"{ETSY_AUTH_URL}?{urlencode(params)}"
+
+    return RedirectResponse(url)
+
+
+@mcp.custom_route("/oauth/callback", methods=["GET"])
+async def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+
+    if error:
+        description = request.query_params.get(
+            "error_description",
+            "Etsy authorization was not completed.",
+        )
+        return HTMLResponse(
+            f"<h2>Etsy authorization failed</h2><p>{description}</p>",
+            status_code=400,
+        )
+
+    if not code or not state:
+        return HTMLResponse(
+            "<h2>Missing OAuth code or state.</h2>",
+            status_code=400,
+        )
+
+    verifier = oauth_sessions.pop(state, None)
+
+    if not verifier:
+        return HTMLResponse(
+            "<h2>Invalid or expired OAuth state.</h2>",
+            status_code=400,
+        )
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": ETSY_API_KEY,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+        "code_verifier": verifier,
+    }
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             ETSY_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": api_key,
-                "refresh_token": refresh_token,
-            },
+            data=data,
+            headers=headers,
         )
-        response.raise_for_status()
-        return response.json()["access_token"]
+
+    if response.status_code >= 400:
+        return HTMLResponse(
+            f"<h2>Etsy token exchange failed</h2>"
+            f"<pre>{response.text}</pre>",
+            status_code=400,
+        )
+
+    token_data = response.json()
+
+    refresh_token = token_data.get("refresh_token")
+
+    if not refresh_token:
+        return HTMLResponse(
+            "<h2>Etsy did not return a refresh token.</h2>",
+            status_code=400,
+        )
+
+    # IMPORTANT:
+    # Do not expose the refresh token in the browser.
+    # It is displayed only as a masked confirmation.
+    masked = (
+        refresh_token[:12] + "..." + refresh_token[-6:]
+        if len(refresh_token) > 20
+        else "***"
+    )
+
+    return HTMLResponse(
+        f"""
+        <html>
+        <body>
+            <h2>Etsy authorization successful</h2>
+            <p>Your Etsy account has authorized this MCP.</p>
+            <p>Refresh token received:</p>
+            <p><strong>{masked}</strong></p>
+            <p>
+                Copy the refresh token from the server logs and save it
+                as the <code>ETSY_REFRESH_TOKEN</code> environment variable
+                in Render.
+            </p>
+            <p>You may close this window.</p>
+        </body>
+        </html>
+        """
+    )
 
 
-async def etsy_get(path: str, params: dict[str, Any] | None = None):
-    api_key = os.environ["ETSY_API_KEY"]
-    shared_secret = os.environ["ETSY_SHARED_SECRET"]
+async def get_access_token():
+    refresh_token = os.environ["ETSY_REFRESH_TOKEN"]
 
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": ETSY_API_KEY,
+        "refresh_token": refresh_token,
+    }
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            ETSY_TOKEN_URL,
+            data=data,
+            headers=headers,
+        )
+
+    response.raise_for_status()
+
+    return response.json()["access_token"]
+
+
+async def etsy_get(path, params=None):
     access_token = await get_access_token()
 
     headers = {
-        "x-api-key": f"{api_key}:{shared_secret}",
+        "x-api-key": f"{ETSY_API_KEY}:{ETSY_SHARED_SECRET}",
         "Authorization": f"Bearer {access_token}",
     }
 
@@ -47,52 +203,52 @@ async def etsy_get(path: str, params: dict[str, Any] | None = None):
             headers=headers,
             params=params,
         )
-        response.raise_for_status()
-        return response.json()
+
+    response.raise_for_status()
+
+    return response.json()
 
 
 @mcp.tool()
 async def get_shop() -> dict:
-    """Get information about the connected Etsy shop."""
+    """Read information about the connected Etsy shop."""
     shop_id = os.environ["ETSY_SHOP_ID"]
-    return await etsy_get(f"/shops/{shop_id}")
+
+    return await etsy_get(
+        f"/shops/{shop_id}"
+    )
 
 
 @mcp.tool()
 async def get_active_listings(limit: int = 100) -> dict:
-    """Get active listings from the connected Etsy shop."""
+    """Read active listings from the connected Etsy shop."""
     shop_id = os.environ["ETSY_SHOP_ID"]
 
     return await etsy_get(
         f"/shops/{shop_id}/listings/active",
         params={
             "limit": min(limit, 100),
-            "includes": "Images,Shop",
         },
     )
 
 
 @mcp.tool()
 async def get_listing(listing_id: int) -> dict:
-    """Get one Etsy listing by listing ID."""
+    """Read one Etsy listing by listing ID."""
     return await etsy_get(
-        f"/listings/{listing_id}",
-        params={
-            "includes": "Images,Shop",
-        },
+        f"/listings/{listing_id}"
     )
 
 
 @mcp.tool()
-async def search_listings(query: str, limit: int = 100) -> list[dict]:
-    """Search the connected shop's active listings by title, description, or tags."""
+async def search_listings(query: str, limit: int = 100) -> list:
+    """Search the shop's active listings by title, description, or tags."""
     shop_id = os.environ["ETSY_SHOP_ID"]
 
     data = await etsy_get(
         f"/shops/{shop_id}/listings/active",
         params={
             "limit": min(limit, 100),
-            "includes": "Images,Shop",
         },
     )
 
@@ -104,14 +260,19 @@ async def search_listings(query: str, limit: int = 100) -> list[dict]:
         description = listing.get("description", "")
         tags = " ".join(listing.get("tags", []))
 
-        searchable_text = (
+        searchable = (
             f"{title} {description} {tags}"
         ).lower()
 
-        if query_lower in searchable_text:
+        if query_lower in searchable:
             matches.append(listing)
 
     return matches
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request):
+    return JSONResponse({"status": "ok"})
 
 
 if __name__ == "__main__":
