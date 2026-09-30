@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, JSONResponse
 
+
 ETSY_API_BASE = "https://api.etsy.com/v3/application"
 ETSY_TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 ETSY_AUTH_URL = "https://www.etsy.com/oauth/connect"
@@ -16,16 +17,15 @@ ETSY_AUTH_URL = "https://www.etsy.com/oauth/connect"
 ETSY_API_KEY = os.environ["ETSY_API_KEY"]
 ETSY_SHARED_SECRET = os.environ["ETSY_SHARED_SECRET"]
 
-# This must match the URL registered in Etsy exactly.
-REDIRECT_URI = os.environ["ETSY_REDIRECT_URI"]
+# This can remain empty during the first deployment.
+# We will add the real Render URL later.
+REDIRECT_URI = os.environ.get("ETSY_REDIRECT_URI", "")
 
 mcp = FastMCP(
     "Lunar Loom Keepsakes Etsy MCP",
     stateless_http=True,
 )
 
-# Temporary OAuth data.
-# This is sufficient for the one-time authorization flow.
 oauth_sessions = {}
 
 
@@ -47,8 +47,19 @@ def create_pkce_pair():
     return verifier, challenge
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request):
+    return JSONResponse({"status": "ok"})
+
+
 @mcp.custom_route("/oauth/start", methods=["GET"])
 async def oauth_start(request: Request):
+    if not REDIRECT_URI:
+        return HTMLResponse(
+            "<h2>ETSY_REDIRECT_URI is not configured yet.</h2>",
+            status_code=500,
+        )
+
     state = secrets.token_urlsafe(32)
     verifier, challenge = create_pkce_pair()
 
@@ -64,9 +75,11 @@ async def oauth_start(request: Request):
         "code_challenge_method": "S256",
     }
 
-    url = f"{ETSY_AUTH_URL}?{urlencode(params)}"
+    authorization_url = (
+        f"{ETSY_AUTH_URL}?{urlencode(params)}"
+    )
 
-    return RedirectResponse(url)
+    return RedirectResponse(authorization_url)
 
 
 @mcp.custom_route("/oauth/callback", methods=["GET"])
@@ -80,8 +93,10 @@ async def oauth_callback(request: Request):
             "error_description",
             "Etsy authorization was not completed.",
         )
+
         return HTMLResponse(
-            f"<h2>Etsy authorization failed</h2><p>{description}</p>",
+            f"<h2>Etsy authorization failed</h2>"
+            f"<p>{description}</p>",
             status_code=400,
         )
 
@@ -120,13 +135,12 @@ async def oauth_callback(request: Request):
 
     if response.status_code >= 400:
         return HTMLResponse(
-            f"<h2>Etsy token exchange failed</h2>"
+            "<h2>Etsy token exchange failed</h2>"
             f"<pre>{response.text}</pre>",
             status_code=400,
         )
 
     token_data = response.json()
-
     refresh_token = token_data.get("refresh_token")
 
     if not refresh_token:
@@ -135,11 +149,10 @@ async def oauth_callback(request: Request):
             status_code=400,
         )
 
-    # IMPORTANT:
-    # Do not expose the refresh token in the browser.
-    # It is displayed only as a masked confirmation.
     masked = (
-        refresh_token[:12] + "..." + refresh_token[-6:]
+        refresh_token[:12]
+        + "..."
+        + refresh_token[-6:]
         if len(refresh_token) > 20
         else "***"
     )
@@ -149,14 +162,20 @@ async def oauth_callback(request: Request):
         <html>
         <body>
             <h2>Etsy authorization successful</h2>
+
             <p>Your Etsy account has authorized this MCP.</p>
-            <p>Refresh token received:</p>
-            <p><strong>{masked}</strong></p>
+
             <p>
-                Copy the refresh token from the server logs and save it
-                as the <code>ETSY_REFRESH_TOKEN</code> environment variable
-                in Render.
+                Refresh token received:
+                <strong>{masked}</strong>
             </p>
+
+            <p>
+                Save the refresh token as the
+                <code>ETSY_REFRESH_TOKEN</code>
+                environment variable in Render.
+            </p>
+
             <p>You may close this window.</p>
         </body>
         </html>
@@ -241,8 +260,12 @@ async def get_listing(listing_id: int) -> dict:
 
 
 @mcp.tool()
-async def search_listings(query: str, limit: int = 100) -> list:
-    """Search the shop's active listings by title, description, or tags."""
+async def search_listings(
+    query: str,
+    limit: int = 100,
+) -> list:
+    """Search active listings by title, description, or tags."""
+
     shop_id = os.environ["ETSY_SHOP_ID"]
 
     data = await etsy_get(
@@ -270,15 +293,14 @@ async def search_listings(query: str, limit: int = 100) -> list:
     return matches
 
 
-@mcp.custom_route("/health", methods=["GET"])
-async def health(request: Request):
-    return JSONResponse({"status": "ok"})
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(
+        os.environ.get("PORT", "8000")
+    )
 
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = port
 
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http"
+    )
