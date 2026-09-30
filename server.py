@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, JSONResponse
 
@@ -19,6 +20,19 @@ ETSY_SHARED_SECRET = os.environ["ETSY_SHARED_SECRET"]
 
 REDIRECT_URI = os.environ.get("ETSY_REDIRECT_URI", "")
 
+RENDER_HOST = "lunarloomkeepsakes-mcp.onrender.com"
+
+# Security settings for the public Render hostname.
+transport_security = TransportSecuritySettings(
+    allowed_hosts=[
+        RENDER_HOST,
+        f"{RENDER_HOST}:*",
+    ],
+    allowed_origins=[
+        f"https://{RENDER_HOST}",
+    ],
+)
+
 mcp = FastMCP(
     "Lunar Loom Keepsakes Etsy MCP",
     stateless_http=True,
@@ -26,7 +40,7 @@ mcp = FastMCP(
 
 oauth_sessions = {}
 
-# Cached automatically discovered shop ID.
+# Automatically discovered Etsy Shop ID.
 _cached_shop_id = None
 
 
@@ -57,7 +71,7 @@ async def health(request: Request):
 async def oauth_start(request: Request):
     if not REDIRECT_URI:
         return HTMLResponse(
-            "<h2>ETSY_REDIRECT_URI is not configured yet.</h2>",
+            "<h2>ETSY_REDIRECT_URI is not configured.</h2>",
             status_code=500,
         )
 
@@ -231,14 +245,8 @@ async def etsy_get(path, params=None):
 
 async def get_shop_id():
     """
-    Automatically discover the Etsy shop connected to
-    the authorized account.
-
-    The Etsy access token has the format:
-        user_id.access_token
-
-    We extract the user ID from the access token and then
-    request the shop associated with that user.
+    Automatically discover the Etsy shop associated
+    with the authorized Etsy account.
     """
 
     global _cached_shop_id
@@ -310,7 +318,7 @@ async def search_listings(
     query: str,
     limit: int = 100,
 ) -> list:
-    """Search active listings by title, description, or tags."""
+    """Search active Etsy listings by title, description, or tags."""
 
     shop_id = await get_shop_id()
 
@@ -348,5 +356,6 @@ if __name__ == "__main__":
     mcp.settings.port = port
 
     mcp.run(
-        transport="streamable-http"
+        transport="streamable-http",
+        transport_security=transport_security,
     )
