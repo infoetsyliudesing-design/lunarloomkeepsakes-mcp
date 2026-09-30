@@ -17,8 +17,6 @@ ETSY_AUTH_URL = "https://www.etsy.com/oauth/connect"
 ETSY_API_KEY = os.environ["ETSY_API_KEY"]
 ETSY_SHARED_SECRET = os.environ["ETSY_SHARED_SECRET"]
 
-# This can remain empty during the first deployment.
-# We will add the real Render URL later.
 REDIRECT_URI = os.environ.get("ETSY_REDIRECT_URI", "")
 
 mcp = FastMCP(
@@ -27,6 +25,9 @@ mcp = FastMCP(
 )
 
 oauth_sessions = {}
+
+# Cached automatically discovered shop ID.
+_cached_shop_id = None
 
 
 def create_pkce_pair():
@@ -171,9 +172,7 @@ async def oauth_callback(request: Request):
             </p>
 
             <p>
-                Save the refresh token as the
-                <code>ETSY_REFRESH_TOKEN</code>
-                environment variable in Render.
+                The refresh token is stored securely in Render.
             </p>
 
             <p>You may close this window.</p>
@@ -205,7 +204,9 @@ async def get_access_token():
 
     response.raise_for_status()
 
-    return response.json()["access_token"]
+    token_data = response.json()
+
+    return token_data["access_token"]
 
 
 async def etsy_get(path, params=None):
@@ -228,10 +229,53 @@ async def etsy_get(path, params=None):
     return response.json()
 
 
+async def get_shop_id():
+    """
+    Automatically discover the Etsy shop connected to
+    the authorized account.
+
+    The Etsy access token has the format:
+        user_id.access_token
+
+    We extract the user ID from the access token and then
+    request the shop associated with that user.
+    """
+
+    global _cached_shop_id
+
+    if _cached_shop_id is not None:
+        return _cached_shop_id
+
+    access_token = await get_access_token()
+
+    try:
+        user_id = int(access_token.split(".", 1)[0])
+    except (ValueError, IndexError):
+        raise RuntimeError(
+            "Unable to determine Etsy user ID from the access token."
+        )
+
+    data = await etsy_get(
+        f"/users/{user_id}/shops"
+    )
+
+    shops = data.get("results", [])
+
+    if not shops:
+        raise RuntimeError(
+            "No Etsy shop was found for the authorized account."
+        )
+
+    _cached_shop_id = shops[0]["shop_id"]
+
+    return _cached_shop_id
+
+
 @mcp.tool()
 async def get_shop() -> dict:
     """Read information about the connected Etsy shop."""
-    shop_id = os.environ["ETSY_SHOP_ID"]
+
+    shop_id = await get_shop_id()
 
     return await etsy_get(
         f"/shops/{shop_id}"
@@ -241,7 +285,8 @@ async def get_shop() -> dict:
 @mcp.tool()
 async def get_active_listings(limit: int = 100) -> dict:
     """Read active listings from the connected Etsy shop."""
-    shop_id = os.environ["ETSY_SHOP_ID"]
+
+    shop_id = await get_shop_id()
 
     return await etsy_get(
         f"/shops/{shop_id}/listings/active",
@@ -254,6 +299,7 @@ async def get_active_listings(limit: int = 100) -> dict:
 @mcp.tool()
 async def get_listing(listing_id: int) -> dict:
     """Read one Etsy listing by listing ID."""
+
     return await etsy_get(
         f"/listings/{listing_id}"
     )
@@ -266,7 +312,7 @@ async def search_listings(
 ) -> list:
     """Search active listings by title, description, or tags."""
 
-    shop_id = os.environ["ETSY_SHOP_ID"]
+    shop_id = await get_shop_id()
 
     data = await etsy_get(
         f"/shops/{shop_id}/listings/active",
