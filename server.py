@@ -356,6 +356,5 @@ if __name__ == "__main__":
     mcp.settings.port = port
 
     mcp.run(
-        transport="streamable-http",
-        transport_security=transport_security,
-    )
+    transport="streamable-http",
+)
