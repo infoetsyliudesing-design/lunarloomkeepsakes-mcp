@@ -36,6 +36,7 @@ transport_security = TransportSecuritySettings(
 mcp = FastMCP(
     "Lunar Loom Keepsakes Etsy MCP",
     stateless_http=True,
+    transport_security=transport_security,
 )
 
 oauth_sessions = {}
